@@ -12,10 +12,10 @@
  *    - https://pi.dev/docs/extensions
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, UserBashEventResult } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { promises as fs } from "node:fs";
-import { join, resolve, relative, dirname, basename } from "node:path";
+import { sep, join, resolve, relative, dirname, basename } from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -26,9 +26,9 @@ const execFileAsync = promisify(execFile);
 // path argument.  Root is the working directory unless a `root` override is
 // passed (not exposed to LLM).
 
-function safeResolve(inputPath: string, root: string = process.cwd()): string {
+export function safeResolve(inputPath: string, root: string = process.cwd()): string {
   const resolved = resolve(root, inputPath);
-  if (!resolved.startsWith(root)) {
+  if (resolved !== root && !resolved.startsWith(root + sep)) {
     throw new Error(`Path traversal blocked: ${inputPath}`);
   }
   return resolved;
@@ -57,7 +57,7 @@ function matchesGitignore(filename: string, patterns: string[]): boolean {
     const cleanPattern = pattern.replace(/\/$/, "");
 
     if (dirOnly) {
-      return filename.includes(cleanPattern);
+      return filename === cleanPattern;
     }
 
     // Simple glob-like matching for common patterns like *.log or node_modules
@@ -139,12 +139,14 @@ interface ToolResult {
 
 async function listDirTool(_toolCallId: string, params: ListDirInput): Promise<ToolResult> {
   const dirPath = safeResolve(params.path);
+  const gitignorePatterns = await loadGitignore(dirPath);
   const entries: { name: string; type: "file" | "directory" }[] = [];
 
   try {
     const rawEntries = await fs.readdir(dirPath, { withFileTypes: true });
     for (const entry of rawEntries) {
       if (!params.all && entry.name.startsWith(".")) continue;
+      if (matchesGitignore(entry.name, gitignorePatterns)) continue;
       entries.push({
         name: entry.name,
         type: entry.isDirectory() ? "directory" : "file",
@@ -179,7 +181,10 @@ async function listDirTool(_toolCallId: string, params: ListDirInput): Promise<T
 
 // ── read_file: replaces `cat` ────────────────────────────────────────
 
-async function readFileTool(_toolCallId: string, params: ReadFileInput): Promise<ToolResult> {
+export async function readFileTool(
+  _toolCallId: string,
+  params: ReadFileInput,
+): Promise<ToolResult> {
   const filePath = safeResolve(params.path);
   const maxBytes = 50 * 1024;
 
@@ -209,7 +214,7 @@ async function readFileTool(_toolCallId: string, params: ReadFileInput): Promise
 
     const output =
       params.offset != null || params.limit != null
-        ? selected.map((line, i) => `${String(i + 1)}|${line}`).join("\n")
+        ? selected.map((line, i) => `${String(i + (params.offset ?? 1))}|${line}`).join("\n")
         : raw;
 
     return {
@@ -249,7 +254,7 @@ async function codeSearchTool(_toolCallId: string, params: CodeSearchInput): Pro
   if (rgAvailable) {
     const rgArgs = ["-n", "--no-heading", "--color=never", "-e", params.pattern, searchDir];
     if (params.filePattern) {
-      rgArgs.splice(3, 0, "-g", `"${params.filePattern}"`);
+      rgArgs.splice(3, 0, "-g", params.filePattern);
     }
     try {
       const { stdout } = await execFileAsync("rg", rgArgs, { cwd: searchDir });
@@ -265,12 +270,10 @@ async function codeSearchTool(_toolCallId: string, params: CodeSearchInput): Pro
         const content = await fs.readFile(file, "utf-8");
         const re = new RegExp(params.pattern, "u");
         const fileLines = content.split("\n");
-        let _found = false;
         fileLines.forEach((line, idx) => {
           if (re.test(line) && matchCount < maxResults) {
             results.push(`  ${file}:${String(idx + 1)}:     ${line.trimEnd()}`);
             matchCount++;
-            _found = true;
           }
         });
         // Stop after a few files even without matches to avoid scanning endlessly
@@ -420,7 +423,10 @@ async function findRecursive(
 
 // ── edit_file: replaces `sed` (exact text replacement, not regex) ─────
 
-async function editFileTool(_toolCallId: string, params: EditFileInput): Promise<ToolResult> {
+export async function editFileTool(
+  _toolCallId: string,
+  params: EditFileInput,
+): Promise<ToolResult> {
   const filePath = safeResolve(params.path);
 
   try {
@@ -452,7 +458,8 @@ async function editFileTool(_toolCallId: string, params: EditFileInput): Promise
       };
     }
 
-    const newContent = content.replace(params.oldText, params.newText);
+    const newContent =
+      content.slice(0, firstIdx) + params.newText + content.slice(firstIdx + params.oldText.length);
     await fs.writeFile(filePath, newContent, "utf-8");
 
     return {
@@ -609,14 +616,9 @@ export default function (pi: ExtensionAPI): void {
   });
 
   // ── Bash interception via event listener ───────────────────────────────
-  (pi.on as (event: string, handler: (ctx: unknown) => void) => void)(
-    "user_bash",
-    (ctx: unknown) => {
-      const c = ctx as Record<string, unknown>;
-      const rawCmd = typeof c.command === "string" ? c.command : "";
-      const matched = INTERCEPT_MAP.find((m) => m.command === rawCmd.trim().split("\s+")[0]);
-      if (!matched) return;
-      return { toolName: matched.toolName };
-    },
-  );
+  pi.on("user_bash", (event) => {
+    const matched = INTERCEPT_MAP.find((m) => m.command === event.command.trim().split(/\s+/)[0]);
+    if (!matched) return;
+    return { toolName: matched.toolName } as unknown as UserBashEventResult;
+  });
 }

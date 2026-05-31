@@ -5,7 +5,9 @@
 
 import { describe, expect, it } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import factory from "./index.js";
+import { promises as fsPromises } from "node:fs";
+import { join } from "node:path";
+import factory, { safeResolve, readFileTool, editFileTool } from "./index.js";
 
 interface RegistrationLog {
   tools: string[];
@@ -96,5 +98,67 @@ describe("@jmcombs/pi-better-toolsy", () => {
 
     expect(log.commands).toHaveLength(0);
     expect(log.shortcuts).toHaveLength(0);
+  });
+});
+
+describe("safeResolve", () => {
+  it("blocks path traversal (../../..)", () => {
+    expect(() => safeResolve("../../../etc/passwd")).toThrow("Path traversal blocked");
+  });
+
+  it("blocks sibling directory bypass (shared name prefix)", () => {
+    expect(() => safeResolve("../project-other/evil", "/home/user/project")).toThrow(
+      "Path traversal blocked",
+    );
+  });
+
+  it("allows valid paths within root", () => {
+    expect(() => safeResolve("packages/foo", "/home/user/project")).not.toThrow();
+  });
+});
+
+describe("readFileTool — line numbering at offset", () => {
+  it("prefixes lines with their true file line number when offset is given", async () => {
+    const filePath = join(
+      process.cwd(),
+      "packages",
+      "better-toolsy",
+      `test-read-${String(Date.now())}.txt`,
+    );
+    const lines = Array.from({ length: 20 }, (_, i) => `content ${String(i + 1)}`);
+    await fsPromises.writeFile(filePath, lines.join("\n"), "utf-8");
+
+    try {
+      const result = await readFileTool("id", { path: filePath, offset: 6, limit: 3 });
+      const text = result.content[0]?.text ?? "";
+      expect(text.startsWith("6|")).toBe(true);
+      expect(text).toContain("7|");
+      expect(text).toContain("8|");
+    } finally {
+      await fsPromises.unlink(filePath);
+    }
+  });
+});
+
+describe("editFileTool — $ special characters in newText", () => {
+  it("inserts $ literally without treating it as a replacement pattern", async () => {
+    const filePath = join(
+      process.cwd(),
+      "packages",
+      "better-toolsy",
+      `test-edit-${String(Date.now())}.txt`,
+    );
+    const original = "function foo() { return x; }";
+    const oldText = "return x;";
+    const newText = "return $`;";
+    await fsPromises.writeFile(filePath, original, "utf-8");
+
+    try {
+      await editFileTool("id", { path: filePath, oldText, newText });
+      const written = await fsPromises.readFile(filePath, "utf-8");
+      expect(written).toBe(`function foo() { ${newText} }`);
+    } finally {
+      await fsPromises.unlink(filePath);
+    }
   });
 });
