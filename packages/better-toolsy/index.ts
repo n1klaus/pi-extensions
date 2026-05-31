@@ -50,25 +50,45 @@ async function loadGitignore(baseDir: string): Promise<string[]> {
   }
 }
 
-function matchesGitignore(filename: string, patterns: string[]): boolean {
-  return patterns.some((pattern: string) => {
-    // Handle directory-only patterns (trailing /)
-    const dirOnly = pattern.endsWith("/");
-    const cleanPattern = pattern.replace(/\/$/, "");
+// relPath is the path relative to the root where the .gitignore lives (or just a basename
+// for single-level calls like listDirTool).  Supports path-based patterns (dist/**) as
+// well as simple name/glob patterns.
+function matchesGitignore(relPath: string, patterns: string[]): boolean {
+  const name = basename(relPath);
+  return patterns.some((raw: string) => {
+    const dirOnly = raw.endsWith("/");
+    const pat = raw.replace(/^\//, "").replace(/\/$/, "");
 
-    if (dirOnly) {
-      return filename === cleanPattern;
+    if (pat.includes("/")) {
+      // "dist/**" should also block the "dist" directory entry itself
+      if (pat.endsWith("/**") && relPath === pat.slice(0, -3)) return true;
+      const reSource =
+        "^" +
+        pat
+          .replace(/\./g, "\\.")
+          .replace(/\*\*/g, "\x00")
+          .replace(/\*/g, "[^/]*")
+          .replace(/\x00/g, ".*") +
+        "$";
+      try {
+        return new RegExp(reSource).test(relPath);
+      } catch {
+        return false;
+      }
     }
 
-    // Simple glob-like matching for common patterns like *.log or node_modules
-    if (pattern.includes("*")) {
-      const regexSource = "^" + pattern.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$";
-      const re = new RegExp(regexSource);
-      return re.test(filename);
+    if (dirOnly) return name === pat;
+
+    if (pat.includes("*")) {
+      const reSource = "^" + pat.replace(/\./g, "\\.").replace(/\*/g, ".*") + "$";
+      try {
+        return new RegExp(reSource).test(name);
+      } catch {
+        return false;
+      }
     }
 
-    // Exact match
-    return basename(filename) === cleanPattern;
+    return name === pat;
   });
 }
 
@@ -127,6 +147,12 @@ const writeFileSchema = Type.Object({
       "File path to write (relative or absolute). Parent dirs are created automatically.",
   }),
   content: Type.String({ description: "Content to write to the file." }),
+  overwrite: Type.Optional(
+    Type.Boolean({
+      description:
+        "Allow overwriting an existing file. Default: false — returns an error if the file already exists.",
+    }),
+  ),
 });
 export type WriteFileInput = Static<typeof writeFileSchema>;
 
@@ -269,10 +295,11 @@ async function codeSearchTool(_toolCallId: string, params: CodeSearchInput): Pro
       try {
         const content = await fs.readFile(file, "utf-8");
         const re = new RegExp(params.pattern, "u");
+        const relFile = relative(process.cwd(), file);
         const fileLines = content.split("\n");
         fileLines.forEach((line, idx) => {
           if (re.test(line) && matchCount < maxResults) {
-            results.push(`  ${file}:${String(idx + 1)}:     ${line.trimEnd()}`);
+            results.push(`  ${relFile}:${String(idx + 1)}:     ${line.trimEnd()}`);
             matchCount++;
           }
         });
@@ -284,11 +311,18 @@ async function codeSearchTool(_toolCallId: string, params: CodeSearchInput): Pro
     }
   }
 
-  // Format rg output into readable results
+  // Format rg output — normalize absolute paths to relative
   if (rgAvailable && lines.length > 0) {
     for (const line of lines) {
       if (matchCount >= maxResults) break;
-      results.push(`  ${line}`);
+      const colonIdx = line.indexOf(":");
+      if (colonIdx > 0) {
+        const absPath = line.slice(0, colonIdx);
+        const rest = line.slice(colonIdx);
+        results.push(`  ${relative(process.cwd(), absPath)}${rest}`);
+      } else {
+        results.push(`  ${line}`);
+      }
       matchCount++;
     }
   }
@@ -312,6 +346,7 @@ async function walkDir(
   dir: string,
   patterns: string[],
   filePattern: string | null,
+  rootDir: string = dir,
 ): Promise<string[]> {
   const files: string[] = [];
   let dirEntries;
@@ -324,13 +359,13 @@ async function walkDir(
   for (const entry of dirEntries) {
     const fullName = join(dir, entry.name);
     if (!entry.name.startsWith(".") || entry.name === ".gitignore") {
-      const ignored = matchesGitignore(entry.name, patterns);
+      const relName = relative(rootDir, fullName);
+      const ignored = matchesGitignore(relName, patterns);
       if (!ignored) {
         if (entry.isDirectory()) {
-          const subFiles = await walkDir(fullName, patterns, filePattern);
+          const subFiles = await walkDir(fullName, patterns, filePattern, rootDir);
           files.push(...subFiles);
         } else {
-          // Apply file pattern filter if provided
           if (!filePattern || matchesFilePattern(entry.name, filePattern)) {
             files.push(fullName);
           }
@@ -356,24 +391,14 @@ async function findFilesTool(_toolCallId: string, params: FindFilesInput): Promi
   const searchDir = safeResolve(params.path ?? ".");
   const gitignorePatterns = await loadGitignore(searchDir);
   const maxResults = 200;
-  let resultCount = 0;
-  const results: string[] = [];
 
-  const found = await findRecursive(
-    searchDir,
-    params.name,
-    gitignorePatterns,
-    maxResults - resultCount,
-  );
-  for (const f of found) {
-    if (resultCount >= maxResults) break;
-    results.push(`   ${relative(process.cwd(), f)}`);
-    resultCount++;
-  }
+  const found = await findRecursive(searchDir, params.name, gitignorePatterns);
+  const capped = found.slice(0, maxResults);
+  const results = capped.map((f) => `   ${relative(process.cwd(), f)}`);
 
   return {
     content: [{ type: "text", text: results.length > 0 ? results.join("\n") : "No files found." }],
-    details: { query: params.name, path: searchDir, filesFound: resultCount },
+    details: { query: params.name, path: searchDir, filesFound: results.length },
   };
 }
 
@@ -381,9 +406,8 @@ async function findRecursive(
   dir: string,
   namePattern: string,
   gitignorePatterns: string[],
-  remaining: number,
+  rootDir: string = dir,
 ): Promise<string[]> {
-  if (remaining <= 0) return [];
   const results: string[] = [];
   let entries;
   try {
@@ -393,26 +417,18 @@ async function findRecursive(
   }
 
   for (const entry of entries) {
-    if (!remaining) break;
-    // Skip dotfiles/dotdirs unless explicitly searching for them
     if (entry.name.startsWith(".") && !namePattern.startsWith(".")) continue;
 
-    const ignored = matchesGitignore(entry.name, gitignorePatterns);
+    const fullPath = join(dir, entry.name);
+    const relPath = relative(rootDir, fullPath);
+    const ignored = matchesGitignore(relPath, gitignorePatterns);
     if (ignored) continue;
 
-    const fullPath = join(dir, entry.name);
-    // Check name/glob match
     if (entry.isDirectory()) {
-      // Also match directory names against pattern
       if (matchesFilePattern(entry.name, namePattern)) {
         results.push(fullPath);
       }
-      const sub = await findRecursive(
-        fullPath,
-        namePattern,
-        gitignorePatterns,
-        remaining - results.length,
-      );
+      const sub = await findRecursive(fullPath, namePattern, gitignorePatterns, rootDir);
       results.push(...sub);
     } else if (matchesFilePattern(entry.name, namePattern)) {
       results.push(fullPath);
@@ -493,10 +509,35 @@ function countOccurrences(haystack: string, needle: string): number {
 
 // ── write_file: replaces creating files via shell (auto-creates parent dirs) ──
 
-async function writeFileTool(_toolCallId: string, params: WriteFileInput): Promise<ToolResult> {
+export async function writeFileTool(
+  _toolCallId: string,
+  params: WriteFileInput,
+): Promise<ToolResult> {
   const filePath = safeResolve(params.path);
 
   try {
+    // Guard against silent overwrites unless caller opts in
+    if (!params.overwrite) {
+      let exists = false;
+      try {
+        await fs.stat(filePath);
+        exists = true;
+      } catch {
+        // file does not exist — proceed
+      }
+      if (exists) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Write failed: ${relative(process.cwd(), filePath)} already exists. Pass overwrite: true to replace it.`,
+            },
+          ],
+          details: { error: true, path: params.path },
+        };
+      }
+    }
+
     // Auto-create parent directories (mkdir -p equivalent)
     const parentDir = dirname(filePath);
     await fs.mkdir(parentDir, { recursive: true });
@@ -609,7 +650,7 @@ export default function (pi: ExtensionAPI): void {
     name: "write_file",
     label: "Write File",
     description:
-      "Write content to a file (auto-creates parent dirs, replaces shell-based file creation.)" +
+      "Write content to a file (auto-creates parent dirs, errors if file exists unless overwrite: true is passed.)" +
       BASH_AVOID_GUIDE,
     parameters: writeFileSchema,
     execute: writeFileTool,

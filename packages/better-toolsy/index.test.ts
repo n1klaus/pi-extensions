@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { promises as fsPromises } from "node:fs";
 import { join } from "node:path";
-import factory, { safeResolve, readFileTool, editFileTool } from "./index.js";
+import factory, { safeResolve, readFileTool, editFileTool, writeFileTool } from "./index.js";
 
 interface RegistrationLog {
   tools: string[];
@@ -157,6 +157,45 @@ describe("editFileTool — $ special characters in newText", () => {
       await editFileTool("id", { path: filePath, oldText, newText });
       const written = await fsPromises.readFile(filePath, "utf-8");
       expect(written).toBe(`function foo() { ${newText} }`);
+    } finally {
+      await fsPromises.unlink(filePath);
+    }
+  });
+});
+
+describe("writeFileTool — overwrite guard", () => {
+  it("returns an error when the file exists and overwrite is not set", async () => {
+    const filePath = join(
+      process.cwd(),
+      "packages",
+      "better-toolsy",
+      `test-write-${String(Date.now())}.txt`,
+    );
+    await fsPromises.writeFile(filePath, "original", "utf-8");
+
+    try {
+      const result = await writeFileTool("id", { path: filePath, content: "replacement" });
+      expect(result.content[0]?.text).toMatch(/already exists/);
+      const still = await fsPromises.readFile(filePath, "utf-8");
+      expect(still).toBe("original");
+    } finally {
+      await fsPromises.unlink(filePath);
+    }
+  });
+
+  it("overwrites when overwrite: true is passed", async () => {
+    const filePath = join(
+      process.cwd(),
+      "packages",
+      "better-toolsy",
+      `test-write-ow-${String(Date.now())}.txt`,
+    );
+    await fsPromises.writeFile(filePath, "original", "utf-8");
+
+    try {
+      await writeFileTool("id", { path: filePath, content: "replaced", overwrite: true });
+      const written = await fsPromises.readFile(filePath, "utf-8");
+      expect(written).toBe("replaced");
     } finally {
       await fsPromises.unlink(filePath);
     }
