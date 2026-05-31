@@ -1,10 +1,9 @@
 /**
- * @jmcombs/pi-better-toolsy — Replace noisy bash commands with compact Node.js tools.
+ * @jmcombs/pi-better-toolsy — Drop-in replacements for Pi's built-in file tools.
  *
- * Provides six file-oriented tools (list_dir, read_file, code_search,
- * find_files, edit_file, write_file) backed by pure `fs/promises` and `path`.
- * Includes optional bash interception that redirects common shell commands to
- * these tools.
+ * Overrides ls, read, grep, find, edit, and write with Node.js implementations
+ * that add: .gitignore awareness, path-traversal protection, $ injection-safe
+ * edits, normalized search paths, and a file-size guard on reads.
  *
  * See:
  *    - CONTRIBUTING.md (project conventions)
@@ -12,7 +11,7 @@
  *    - https://pi.dev/docs/extensions
  */
 
-import type { ExtensionAPI, UserBashEventResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
 import { promises as fs } from "node:fs";
 import { sep, join, resolve, relative, dirname, basename } from "node:path";
@@ -35,7 +34,6 @@ export function safeResolve(inputPath: string, root: string = process.cwd()): st
 }
 
 // ── .gitignore awareness ───────────────────────────────────────────────
-// Loads the nearest .gitignore and returns an array of pattern strings.
 
 async function loadGitignore(baseDir: string): Promise<string[]> {
   const gitignoreFile = join(baseDir, ".gitignore");
@@ -50,9 +48,9 @@ async function loadGitignore(baseDir: string): Promise<string[]> {
   }
 }
 
-// relPath is the path relative to the root where the .gitignore lives (or just a basename
-// for single-level calls like listDirTool).  Supports path-based patterns (dist/**) as
-// well as simple name/glob patterns.
+// relPath is the path relative to the root where the .gitignore lives (or just a
+// basename for single-level calls like lsTool).  Supports path-based patterns
+// (dist/**) as well as simple name/glob patterns.
 function matchesGitignore(relPath: string, patterns: string[]): boolean {
   const name = basename(relPath);
   return patterns.some((raw: string) => {
@@ -92,86 +90,94 @@ function matchesGitignore(relPath: string, patterns: string[]): boolean {
   });
 }
 
-// ── Tool schemas ─────────────────────────────────────────────────────
+// ── Schemas — match Pi's built-in tool signatures exactly ─────────────
 
-const listDirSchema = Type.Object({
-  path: Type.String({ description: "Directory path to list (relative or absolute)." }),
-  all: Type.Optional(
-    Type.Boolean({ description: "Include hidden files (dotfiles). Default: false." }),
+const lsSchema = Type.Object({
+  path: Type.Optional(
+    Type.String({ description: "Directory path to list (relative or absolute). Defaults to cwd." }),
   ),
+  limit: Type.Optional(Type.Integer({ description: "Maximum number of entries to return." })),
 });
-export type ListDirInput = Static<typeof listDirSchema>;
+export type LsInput = Static<typeof lsSchema>;
 
-const readFileSchema = Type.Object({
+const readSchema = Type.Object({
   path: Type.String({ description: "File path to read (relative or absolute)." }),
-  offset: Type.Optional(
-    Type.Integer({ description: "Line number to start from (1-indexed, optional)." }),
-  ),
+  offset: Type.Optional(Type.Integer({ description: "Line number to start from (1-indexed)." })),
   limit: Type.Optional(
-    Type.Integer({
-      description: "Maximum lines to return from offset (optional). If omitted, returns full file.",
-    }),
+    Type.Integer({ description: "Maximum lines to return. If omitted, returns the full file." }),
   ),
 });
-export type ReadFileInput = Static<typeof readFileSchema>;
+export type ReadInput = Static<typeof readSchema>;
 
-const codeSearchSchema = Type.Object({
+const grepSchema = Type.Object({
   pattern: Type.String({ description: "Regular expression or substring to search for." }),
   path: Type.Optional(
     Type.String({ description: "Directory to search in (relative or absolute). Defaults to cwd." }),
   ),
-  filePattern: Type.Optional(
-    Type.String({ description: "Glob pattern to filter files (e.g. '*.ts'). Optional." }),
+  glob: Type.Optional(
+    Type.String({ description: "Glob pattern to restrict files (e.g. '*.ts')." }),
   ),
+  ignoreCase: Type.Optional(Type.Boolean({ description: "Case-insensitive search." })),
+  literal: Type.Optional(
+    Type.Boolean({ description: "Treat pattern as a literal string, not a regex." }),
+  ),
+  context: Type.Optional(
+    Type.Integer({ description: "Lines of context to show around each match." }),
+  ),
+  limit: Type.Optional(Type.Integer({ description: "Maximum matches to return. Default: 100." })),
 });
-export type CodeSearchInput = Static<typeof codeSearchSchema>;
+export type GrepInput = Static<typeof grepSchema>;
 
-const findFilesSchema = Type.Object({
-  name: Type.String({ description: "Name or glob pattern to match (e.g. '*.log' or '.env')." }),
+const findSchema = Type.Object({
+  pattern: Type.String({ description: "Glob pattern to match (e.g. '*.log' or '.env')." }),
   path: Type.Optional(
     Type.String({ description: "Directory to search in (relative or absolute). Defaults to cwd." }),
   ),
+  limit: Type.Optional(Type.Integer({ description: "Maximum results to return. Default: 200." })),
 });
-export type FindFilesInput = Static<typeof findFilesSchema>;
+export type FindInput = Static<typeof findSchema>;
 
-const editFileSchema = Type.Object({
+const editSchema = Type.Object({
   path: Type.String({ description: "File path to edit (relative or absolute)." }),
-  oldText: Type.String({ description: "Exact text to replace (must match a unique region)." }),
-  newText: Type.String({ description: "Replacement text." }),
-});
-export type EditFileInput = Static<typeof editFileSchema>;
-
-const writeFileSchema = Type.Object({
-  path: Type.String({
-    description:
-      "File path to write (relative or absolute). Parent dirs are created automatically.",
-  }),
-  content: Type.String({ description: "Content to write to the file." }),
-  overwrite: Type.Optional(
-    Type.Boolean({
-      description:
-        "Allow overwriting an existing file. Default: false — returns an error if the file already exists.",
+  edits: Type.Array(
+    Type.Object({
+      oldText: Type.String({ description: "Exact text to replace (must appear exactly once)." }),
+      newText: Type.String({ description: "Replacement text." }),
     }),
+    {
+      description:
+        "Edits to apply in sequence. Each oldText must be unique in the file at the time it is applied.",
+    },
   ),
 });
-export type WriteFileInput = Static<typeof writeFileSchema>;
+export type EditInput = Static<typeof editSchema>;
 
-// ── Tool implementations ───────────────────────────────────────────────
+const writeSchema = Type.Object({
+  path: Type.String({
+    description: "File path to write (relative or absolute). Parent dirs created automatically.",
+  }),
+  content: Type.String({ description: "Content to write to the file." }),
+});
+export type WriteInput = Static<typeof writeSchema>;
+
+// ── Tool result type ───────────────────────────────────────────────────
 
 interface ToolResult {
   content: { type: "text"; text: string }[];
   details: Record<string, unknown>;
 }
 
-async function listDirTool(_toolCallId: string, params: ListDirInput): Promise<ToolResult> {
-  const dirPath = safeResolve(params.path);
+// ── ls ─────────────────────────────────────────────────────────────────
+
+async function lsTool(_toolCallId: string, params: LsInput): Promise<ToolResult> {
+  const dirPath = safeResolve(params.path ?? ".");
   const gitignorePatterns = await loadGitignore(dirPath);
   const entries: { name: string; type: "file" | "directory" }[] = [];
 
   try {
     const rawEntries = await fs.readdir(dirPath, { withFileTypes: true });
     for (const entry of rawEntries) {
-      if (!params.all && entry.name.startsWith(".")) continue;
+      if (entry.name.startsWith(".")) continue;
       if (matchesGitignore(entry.name, gitignorePatterns)) continue;
       entries.push({
         name: entry.name,
@@ -187,30 +193,33 @@ async function listDirTool(_toolCallId: string, params: ListDirInput): Promise<T
   }
 
   const sorted = entries.sort((a, b) => {
-    // Directories first, then files; alphabetical within each group
     if (a.type !== b.type) return a.type === "directory" ? -1 : 1;
     return a.name.localeCompare(b.name);
   });
+
+  const limit = params.limit ?? sorted.length;
+  const capped = sorted.slice(0, limit);
 
   return {
     content: [
       {
         type: "text",
         text:
-          sorted.map((e) => (e.type === "directory" ? `${e.name}/` : e.name)).join("\n") ||
+          capped.map((e) => (e.type === "directory" ? `${e.name}/` : e.name)).join("\n") ||
           "(empty)",
       },
     ],
-    details: { path: params.path, entries: sorted.length },
+    details: {
+      path: params.path ?? ".",
+      entries: capped.length,
+      truncated: capped.length < sorted.length,
+    },
   };
 }
 
-// ── read_file: replaces `cat` ────────────────────────────────────────
+// ── read ───────────────────────────────────────────────────────────────
 
-export async function readFileTool(
-  _toolCallId: string,
-  params: ReadFileInput,
-): Promise<ToolResult> {
+export async function readTool(_toolCallId: string, params: ReadInput): Promise<ToolResult> {
   const filePath = safeResolve(params.path);
   const maxBytes = 50 * 1024;
 
@@ -221,7 +230,7 @@ export async function readFileTool(
         content: [
           {
             type: "text",
-            text: `File is ${String(stat.size)} bytes. Use 'offset'/'limit' to read portions.`,
+            text: `File is ${String(stat.size)} bytes. Use offset/limit to read portions.`,
           },
         ],
         details: { path: params.path, size: stat.size },
@@ -256,16 +265,15 @@ export async function readFileTool(
   }
 }
 
-// ── code_search: replaces `grep`/`rg` (with optional rg fast-path) ──
+// ── grep ───────────────────────────────────────────────────────────────
 
-async function codeSearchTool(_toolCallId: string, params: CodeSearchInput): Promise<ToolResult> {
+async function grepTool(_toolCallId: string, params: GrepInput): Promise<ToolResult> {
   const searchDir = safeResolve(params.path ?? ".");
   const gitignorePatterns = await loadGitignore(searchDir);
-  const maxResults = 100;
+  const maxResults = params.limit ?? 100;
   let matchCount = 0;
   const results: string[] = [];
 
-  // Try `rg` fast-path first, fall back to Node.js
   const rgAvailable = await new Promise<boolean>((res) => {
     execFileAsync("rg", ["--version"], { cwd: searchDir })
       .then(() => {
@@ -278,10 +286,12 @@ async function codeSearchTool(_toolCallId: string, params: CodeSearchInput): Pro
 
   let lines: string[] = [];
   if (rgAvailable) {
-    const rgArgs = ["-n", "--no-heading", "--color=never", "-e", params.pattern, searchDir];
-    if (params.filePattern) {
-      rgArgs.splice(3, 0, "-g", params.filePattern);
-    }
+    const rgArgs = ["-n", "--no-heading", "--color=never"];
+    if (params.ignoreCase) rgArgs.push("-i");
+    if (params.literal) rgArgs.push("-F");
+    if (params.context != null) rgArgs.push("-C", String(params.context));
+    if (params.glob) rgArgs.push("-g", params.glob);
+    rgArgs.push("-e", params.pattern, searchDir);
     try {
       const { stdout } = await execFileAsync("rg", rgArgs, { cwd: searchDir });
       lines = stdout.trim().split("\n").filter(Boolean);
@@ -289,21 +299,25 @@ async function codeSearchTool(_toolCallId: string, params: CodeSearchInput): Pro
       lines = [];
     }
   } else {
-    // Node.js fallback: recursive directory walk
-    const allFiles = await walkDir(searchDir, gitignorePatterns, params.filePattern ?? null);
+    const allFiles = await walkDir(searchDir, gitignorePatterns, params.glob ?? null);
+    const reFlags = params.ignoreCase ? "iu" : "u";
+    const re = params.literal ? null : new RegExp(params.pattern, reFlags);
     for (const file of allFiles) {
       try {
         const content = await fs.readFile(file, "utf-8");
-        const re = new RegExp(params.pattern, "u");
         const relFile = relative(process.cwd(), file);
         const fileLines = content.split("\n");
         fileLines.forEach((line, idx) => {
-          if (re.test(line) && matchCount < maxResults) {
+          const hit = re
+            ? re.test(line)
+            : params.ignoreCase
+              ? line.toLowerCase().includes(params.pattern.toLowerCase())
+              : line.includes(params.pattern);
+          if (hit && matchCount < maxResults) {
             results.push(`  ${relFile}:${String(idx + 1)}:     ${line.trimEnd()}`);
             matchCount++;
           }
         });
-        // Stop after a few files even without matches to avoid scanning endlessly
         if (matchCount >= maxResults) break;
       } catch {
         // skip binary/unreadable files
@@ -311,7 +325,6 @@ async function codeSearchTool(_toolCallId: string, params: CodeSearchInput): Pro
     }
   }
 
-  // Format rg output — normalize absolute paths to relative
   if (rgAvailable && lines.length > 0) {
     for (const line of lines) {
       if (matchCount >= maxResults) break;
@@ -331,16 +344,11 @@ async function codeSearchTool(_toolCallId: string, params: CodeSearchInput): Pro
     content: [
       { type: "text", text: results.length > 0 ? results.join("\n") : "No matches found." },
     ],
-    details: {
-      query: params.pattern,
-      path: searchDir,
-      matches: matchCount,
-      usedRg: rgAvailable && lines.length > 0,
-    },
+    details: { query: params.pattern, path: searchDir, matches: matchCount, usedRg: rgAvailable },
   };
 }
 
-// ── Recursive directory walker (used by code_search Node.js fallback) ──
+// ── Recursive directory walker (grep Node.js fallback) ─────────────────
 
 async function walkDir(
   dir: string,
@@ -353,7 +361,7 @@ async function walkDir(
   try {
     dirEntries = await fs.readdir(dir, { withFileTypes: true });
   } catch {
-    return []; // unreadable directory, skip silently
+    return [];
   }
 
   for (const entry of dirEntries) {
@@ -377,7 +385,6 @@ async function walkDir(
 }
 
 function matchesFilePattern(filename: string, pattern: string): boolean {
-  // Simple glob-to-regex for patterns like "*.ts" or "*.test.js"
   if (!pattern.includes("*")) {
     return filename === pattern;
   }
@@ -385,20 +392,20 @@ function matchesFilePattern(filename: string, pattern: string): boolean {
   return new RegExp(regexSource).test(filename);
 }
 
-// ── find_files: replaces `find` ──────────────────────────────────────
+// ── find ───────────────────────────────────────────────────────────────
 
-async function findFilesTool(_toolCallId: string, params: FindFilesInput): Promise<ToolResult> {
+async function findTool(_toolCallId: string, params: FindInput): Promise<ToolResult> {
   const searchDir = safeResolve(params.path ?? ".");
   const gitignorePatterns = await loadGitignore(searchDir);
-  const maxResults = 200;
+  const maxResults = params.limit ?? 200;
 
-  const found = await findRecursive(searchDir, params.name, gitignorePatterns);
+  const found = await findRecursive(searchDir, params.pattern, gitignorePatterns);
   const capped = found.slice(0, maxResults);
   const results = capped.map((f) => `   ${relative(process.cwd(), f)}`);
 
   return {
     content: [{ type: "text", text: results.length > 0 ? results.join("\n") : "No files found." }],
-    details: { query: params.name, path: searchDir, filesFound: results.length },
+    details: { query: params.pattern, path: searchDir, filesFound: results.length },
   };
 }
 
@@ -437,56 +444,57 @@ async function findRecursive(
   return results;
 }
 
-// ── edit_file: replaces `sed` (exact text replacement, not regex) ─────
+// ── edit ───────────────────────────────────────────────────────────────
 
-export async function editFileTool(
-  _toolCallId: string,
-  params: EditFileInput,
-): Promise<ToolResult> {
+export async function editTool(_toolCallId: string, params: EditInput): Promise<ToolResult> {
   const filePath = safeResolve(params.path);
 
   try {
-    const content = await fs.readFile(filePath, "utf-8");
-    // Validate that oldText appears exactly once to avoid ambiguity
-    const firstIdx = content.indexOf(params.oldText);
-    if (firstIdx === -1) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Edit failed: 'oldText' not found in ${relative(process.cwd(), filePath)}. The exact text must match the file contents.`,
-          },
-        ],
-        details: { error: true, path: params.path },
-      };
+    let content = await fs.readFile(filePath, "utf-8");
+
+    // Validate uniqueness and apply each edit in sequence so later edits see
+    // earlier ones (allows dependent edits in one call).
+    for (const edit of params.edits) {
+      const firstIdx = content.indexOf(edit.oldText);
+      if (firstIdx === -1) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Edit failed: oldText not found in ${relative(process.cwd(), filePath)}.\n"${edit.oldText.slice(0, 80)}${edit.oldText.length > 80 ? "…" : ""}"`,
+            },
+          ],
+          details: { error: true, path: params.path },
+        };
+      }
+
+      const secondIdx = content.indexOf(edit.oldText, firstIdx + edit.oldText.length);
+      if (secondIdx !== -1) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Edit failed: oldText appears ${String(countOccurrences(content, edit.oldText))} times in ${relative(process.cwd(), filePath)}. Add more surrounding context to make it unique.`,
+            },
+          ],
+          details: { error: true, path: params.path },
+        };
+      }
+
+      content =
+        content.slice(0, firstIdx) + edit.newText + content.slice(firstIdx + edit.oldText.length);
     }
 
-    const secondIdx = content.indexOf(params.oldText, firstIdx + params.oldText.length);
-    if (secondIdx !== -1) {
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Edit failed: 'oldText' appears ${String(countOccurrences(content, params.oldText))} times in ${relative(process.cwd(), filePath)}. It must match a unique region. Add more surrounding context to make it unique.`,
-          },
-        ],
-        details: { error: true, path: params.path },
-      };
-    }
-
-    const newContent =
-      content.slice(0, firstIdx) + params.newText + content.slice(firstIdx + params.oldText.length);
-    await fs.writeFile(filePath, newContent, "utf-8");
+    await fs.writeFile(filePath, content, "utf-8");
 
     return {
       content: [
-        { type: "text", text: `Edited ${relative(process.cwd(), filePath)} — replaced 1 match.` },
+        {
+          type: "text",
+          text: `Edited ${relative(process.cwd(), filePath)} — applied ${String(params.edits.length)} edit${params.edits.length === 1 ? "" : "s"}.`,
+        },
       ],
-      details: {
-        path: params.path,
-        oldLength: params.oldText.length,
-        newLength: params.newText.length,
-      },
+      details: { path: params.path, edits: params.edits.length },
     };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
@@ -507,41 +515,14 @@ function countOccurrences(haystack: string, needle: string): number {
   return count;
 }
 
-// ── write_file: replaces creating files via shell (auto-creates parent dirs) ──
+// ── write ──────────────────────────────────────────────────────────────
 
-export async function writeFileTool(
-  _toolCallId: string,
-  params: WriteFileInput,
-): Promise<ToolResult> {
+async function writeTool(_toolCallId: string, params: WriteInput): Promise<ToolResult> {
   const filePath = safeResolve(params.path);
 
   try {
-    // Guard against silent overwrites unless caller opts in
-    if (!params.overwrite) {
-      let exists = false;
-      try {
-        await fs.stat(filePath);
-        exists = true;
-      } catch {
-        // file does not exist — proceed
-      }
-      if (exists) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Write failed: ${relative(process.cwd(), filePath)} already exists. Pass overwrite: true to replace it.`,
-            },
-          ],
-          details: { error: true, path: params.path },
-        };
-      }
-    }
-
-    // Auto-create parent directories (mkdir -p equivalent)
     const parentDir = dirname(filePath);
     await fs.mkdir(parentDir, { recursive: true });
-
     await fs.writeFile(filePath, params.content, "utf-8");
     const stat = await fs.stat(filePath);
 
@@ -552,7 +533,7 @@ export async function writeFileTool(
           text: `Wrote ${relative(process.cwd(), filePath)} (${String(stat.size)} bytes).`,
         },
       ],
-      details: { path: params.path, size: stat.size, created: true },
+      details: { path: params.path, size: stat.size },
     };
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
@@ -563,103 +544,57 @@ export async function writeFileTool(
   }
 }
 
-// ── Prompt guideline text reused across tools ─────────────────────────
-
-const BASH_AVOID_GUIDE =
-  "\nUse this tool instead of the bash equivalent " +
-  "(bash:ls, bash:cat, bash:grep, bash:sed, bash:find — noisy and inconsistent).";
-
-// ── Bash interception: maps common shell commands to our tools ─────────
-
-interface InterceptMap {
-  command: string;
-  toolName: string;
-}
-
-const INTERCEPT_MAP: InterceptMap[] = [
-  { command: "ls", toolName: "list_dir" },
-  { command: "cat", toolName: "read_file" },
-  { command: "grep", toolName: "code_search" },
-  { command: "rg", toolName: "code_search" },
-  { command: "find", toolName: "find_files" },
-  { command: "sed", toolName: "edit_file" },
-];
-
 // ── Extension factory ──────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI): void {
-  // Register the bash-interception flag so it can be toggled if needed
-  pi.registerFlag("intercept-bash", {
-    type: "boolean",
-    default: true,
-    description: "Intercept common bash file commands and route them to Node.js tools.",
-  });
-
-  // ── Tools ────────────────────────────────────────────────────────────
-
   pi.registerTool({
-    name: "list_dir",
+    name: "ls",
     label: "List Directory",
-    description:
-      "List files and directories (replaces `ls`. Respects .gitignore, hides dotfiles by default, cross-platform.)" +
-      BASH_AVOID_GUIDE,
-    parameters: listDirSchema,
-    execute: listDirTool,
+    description: "List files and directories. Respects .gitignore, hides dotfiles.",
+    parameters: lsSchema,
+    execute: lsTool,
   });
 
   pi.registerTool({
-    name: "read_file",
+    name: "read",
     label: "Read File",
     description:
-      "Read file contents with optional offset/limit (replaces `cat`. Safe path resolution, .gitignore-aware.)" +
-      BASH_AVOID_GUIDE,
-    parameters: readFileSchema,
-    execute: readFileTool,
+      "Read file contents with optional offset/limit. Guards against large files (50 KB cap).",
+    parameters: readSchema,
+    execute: readTool,
   });
 
   pi.registerTool({
-    name: "code_search",
-    label: "Code Search",
+    name: "grep",
+    label: "Search",
     description:
-      "Search for patterns in code files (replaces `grep`/`rg`. Uses ripgrep if available, falls back to Node.js. Respects .gitignore.)" +
-      BASH_AVOID_GUIDE,
-    parameters: codeSearchSchema,
-    execute: codeSearchTool,
+      "Search for patterns in code files. Uses ripgrep if available, falls back to Node.js. Respects .gitignore.",
+    parameters: grepSchema,
+    execute: grepTool,
   });
 
   pi.registerTool({
-    name: "find_files",
+    name: "find",
     label: "Find Files",
-    description:
-      "Find files by name pattern (replaces `find`. Respects .gitignore.)" + BASH_AVOID_GUIDE,
-    parameters: findFilesSchema,
-    execute: findFilesTool,
+    description: "Find files by name pattern. Respects .gitignore.",
+    parameters: findSchema,
+    execute: findTool,
   });
 
   pi.registerTool({
-    name: "edit_file",
+    name: "edit",
     label: "Edit File",
     description:
-      "Edit a file by replacing exact text (replaces `sed`. Validates uniqueness of match.)" +
-      BASH_AVOID_GUIDE,
-    parameters: editFileSchema,
-    execute: editFileTool,
+      "Edit a file by replacing exact text. Each oldText must be unique. Supports multiple edits in one call.",
+    parameters: editSchema,
+    execute: editTool,
   });
 
   pi.registerTool({
-    name: "write_file",
+    name: "write",
     label: "Write File",
-    description:
-      "Write content to a file (auto-creates parent dirs, errors if file exists unless overwrite: true is passed.)" +
-      BASH_AVOID_GUIDE,
-    parameters: writeFileSchema,
-    execute: writeFileTool,
-  });
-
-  // ── Bash interception via event listener ───────────────────────────────
-  pi.on("user_bash", (event) => {
-    const matched = INTERCEPT_MAP.find((m) => m.command === event.command.trim().split(/\s+/)[0]);
-    if (!matched) return;
-    return { toolName: matched.toolName } as unknown as UserBashEventResult;
+    description: "Write content to a file. Creates parent directories automatically.",
+    parameters: writeSchema,
+    execute: writeTool,
   });
 }

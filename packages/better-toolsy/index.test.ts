@@ -1,13 +1,16 @@
 /**
- * Smoke test — verifies the extension's default factory loads and registers
- * the resources it claims to register.
+ * Tests for @jmcombs/pi-better-toolsy.
+ *
+ * Smoke tests verify the extension registers the correct built-in tool
+ * overrides.  Integration tests exercise the core implementations with real
+ * temp files.
  */
 
 import { describe, expect, it } from "vitest";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { promises as fsPromises } from "node:fs";
 import { join } from "node:path";
-import factory, { safeResolve, readFileTool, editFileTool, writeFileTool } from "./index.js";
+import factory, { safeResolve, readTool, editTool } from "./index.js";
 
 interface RegistrationLog {
   tools: string[];
@@ -72,30 +75,24 @@ describe("@jmcombs/pi-better-toolsy", () => {
     expect(typeof factory).toBe("function");
   });
 
-  it("registers all 6 file tools", () => {
+  it("overrides all 6 built-in Pi tools", () => {
     const { api, log } = createApiStub();
     factory(api);
 
-    expect(log.tools).toContain("list_dir");
-    expect(log.tools).toContain("read_file");
-    expect(log.tools).toContain("code_search");
-    expect(log.tools).toContain("find_files");
-    expect(log.tools).toContain("edit_file");
-    expect(log.tools).toContain("write_file");
+    expect(log.tools).toContain("ls");
+    expect(log.tools).toContain("read");
+    expect(log.tools).toContain("grep");
+    expect(log.tools).toContain("find");
+    expect(log.tools).toContain("edit");
+    expect(log.tools).toContain("write");
     expect(log.tools).toHaveLength(6);
   });
 
-  it("registers the intercept-bash flag", () => {
+  it("registers no flags, commands, or shortcuts", () => {
     const { api, log } = createApiStub();
     factory(api);
 
-    expect(log.flags).toContain("intercept-bash");
-  });
-
-  it("registers no commands or shortcuts (file-only, no TUI)", () => {
-    const { api, log } = createApiStub();
-    factory(api);
-
+    expect(log.flags).toHaveLength(0);
     expect(log.commands).toHaveLength(0);
     expect(log.shortcuts).toHaveLength(0);
   });
@@ -117,7 +114,7 @@ describe("safeResolve", () => {
   });
 });
 
-describe("readFileTool — line numbering at offset", () => {
+describe("readTool — line numbering at offset", () => {
   it("prefixes lines with their true file line number when offset is given", async () => {
     const filePath = join(
       process.cwd(),
@@ -129,7 +126,7 @@ describe("readFileTool — line numbering at offset", () => {
     await fsPromises.writeFile(filePath, lines.join("\n"), "utf-8");
 
     try {
-      const result = await readFileTool("id", { path: filePath, offset: 6, limit: 3 });
+      const result = await readTool("id", { path: filePath, offset: 6, limit: 3 });
       const text = result.content[0]?.text ?? "";
       expect(text.startsWith("6|")).toBe(true);
       expect(text).toContain("7|");
@@ -140,7 +137,7 @@ describe("readFileTool — line numbering at offset", () => {
   });
 });
 
-describe("editFileTool — $ special characters in newText", () => {
+describe("editTool", () => {
   it("inserts $ literally without treating it as a replacement pattern", async () => {
     const filePath = join(
       process.cwd(),
@@ -154,48 +151,33 @@ describe("editFileTool — $ special characters in newText", () => {
     await fsPromises.writeFile(filePath, original, "utf-8");
 
     try {
-      await editFileTool("id", { path: filePath, oldText, newText });
+      await editTool("id", { path: filePath, edits: [{ oldText, newText }] });
       const written = await fsPromises.readFile(filePath, "utf-8");
       expect(written).toBe(`function foo() { ${newText} }`);
     } finally {
       await fsPromises.unlink(filePath);
     }
   });
-});
 
-describe("writeFileTool — overwrite guard", () => {
-  it("returns an error when the file exists and overwrite is not set", async () => {
+  it("applies multiple edits in sequence within one call", async () => {
     const filePath = join(
       process.cwd(),
       "packages",
       "better-toolsy",
-      `test-write-${String(Date.now())}.txt`,
+      `test-multi-${String(Date.now())}.txt`,
     );
-    await fsPromises.writeFile(filePath, "original", "utf-8");
+    await fsPromises.writeFile(filePath, "alpha beta gamma", "utf-8");
 
     try {
-      const result = await writeFileTool("id", { path: filePath, content: "replacement" });
-      expect(result.content[0]?.text).toMatch(/already exists/);
-      const still = await fsPromises.readFile(filePath, "utf-8");
-      expect(still).toBe("original");
-    } finally {
-      await fsPromises.unlink(filePath);
-    }
-  });
-
-  it("overwrites when overwrite: true is passed", async () => {
-    const filePath = join(
-      process.cwd(),
-      "packages",
-      "better-toolsy",
-      `test-write-ow-${String(Date.now())}.txt`,
-    );
-    await fsPromises.writeFile(filePath, "original", "utf-8");
-
-    try {
-      await writeFileTool("id", { path: filePath, content: "replaced", overwrite: true });
+      await editTool("id", {
+        path: filePath,
+        edits: [
+          { oldText: "alpha", newText: "ALPHA" },
+          { oldText: "gamma", newText: "GAMMA" },
+        ],
+      });
       const written = await fsPromises.readFile(filePath, "utf-8");
-      expect(written).toBe("replaced");
+      expect(written).toBe("ALPHA beta GAMMA");
     } finally {
       await fsPromises.unlink(filePath);
     }
