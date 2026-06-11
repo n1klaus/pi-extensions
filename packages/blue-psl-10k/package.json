@@ -1,0 +1,50 @@
+{
+  "name": "@jmcombs/pi-blue-psl-10k",
+  "version": "0.0.0",
+  "description": "Powerline-styled footer extension with the Blue PSL 10K theme — single-line status bar with git, context usage, token counts, and cost.",
+  "homepage": "https://github.com/jmcombs/pi-extensions/tree/main/packages/blue-psl-10k",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jmcombs/pi-extensions.git",
+    "directory": "packages/blue-psl-10k"
+  },
+  "bugs": {
+    "url": "https://github.com/jmcombs/pi-extensions/issues"
+  },
+  "license": "MIT",
+  "author": "Jeremy Combs",
+  "type": "module",
+  "main": "./index.ts",
+  "types": "./index.ts",
+  "files": [
+    "index.ts",
+    "themes/",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "footer",
+    "powerline",
+    "status-bar",
+    "theme"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "themes": [
+      "./themes"
+    ],
+    "image": "https://raw.githubusercontent.com/jmcombs/pi-extensions/main/assets/blue-psl-10k/preview.png"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
