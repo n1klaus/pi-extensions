@@ -58,6 +58,7 @@ import { compressMessages } from "./compress.js";
 import { filterByQuery } from "./query.js";
 import {
   formatStatusLine,
+  formatStatusWidget,
   getProxyStatus,
   humanizeTokens,
   type ProxyStatusState,
@@ -82,6 +83,18 @@ const AUTORETRIEVE_MAX_MARKERS = 3;
 
 /** Stable key for the persistent above-editor status widget. */
 const STATUS_WIDGET_KEY = "headroom";
+
+/**
+ * Delay before the one extra startup re-render of the status widget. The TUI
+ * orders above-editor widgets by *last render*, and `setWidget` re-appends on
+ * every call. When the proxy is reachable our snapshot probe takes two HTTP
+ * round-trips, so our re-render naturally lands after other extensions' startup
+ * widgets (e.g. a prompt enhancer) and we sit at the bottom. When the proxy is
+ * **down**, the probe fails instantly, so without this our re-render would land
+ * *before* those widgets and leave us stranded above them. A single deferred
+ * re-render makes both paths settle identically — always last, always bottom.
+ */
+const WIDGET_SETTLE_MS = 300;
 
 /**
  * Minimum gap between proxy-snapshot refreshes. The session figure updates for
@@ -651,7 +664,7 @@ export default function (pi: ExtensionAPI): void {
     if (!ctx.hasUI) return;
     const state: StatusDisplayState = { enabled: isEnabled(), ...proxySnapshot };
     try {
-      ctx.ui.setWidget(STATUS_WIDGET_KEY, [formatStatusLine(state, sessionTokensSaved)], {
+      ctx.ui.setWidget(STATUS_WIDGET_KEY, [formatStatusWidget(state, sessionTokensSaved)], {
         placement: "aboveEditor",
       });
     } catch {
@@ -863,6 +876,9 @@ export default function (pi: ExtensionAPI): void {
     lastEnabled = isEnabled();
     refreshProxySnapshot(ctx, true);
     renderStatusDisplay(ctx);
+    // One deferred re-render so we reliably land at the bottom of the
+    // above-editor stack even when the proxy is down (see WIDGET_SETTLE_MS).
+    setTimeout(() => renderStatusDisplay(ctx), WIDGET_SETTLE_MS);
 
     if (noticeShown) return;
     try {
