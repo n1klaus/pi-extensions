@@ -57,6 +57,9 @@ keeps the core backend-agnostic.
   + Phase 1 (scaffold) → **one PR** against `main`. **This supersedes phase-build's
   branch-per-phase default** — it is an explicit project decision; the verifier must
   treat the single-branch layout as **compliant**, not a hygiene FAIL.
+- **From Phase 2 on, each phase gets its own branch → its own PR** (`feat/relay-phase2`,
+  …), per the standard branch-per-phase model; Phase 0+1 sharing one branch was a
+  one-time bootstrap exception.
 - [Conventional Commits](https://www.conventionalcommits.org/), scope `relay`.
   `commitlint` (`header-max-length` 100) enforced by the `commit-msg` hook. `biome`
   runs on staged files via the `pre-commit` hook.
@@ -158,11 +161,63 @@ seam with verdict-parse in the consumer (D10).
 
 ---
 
-## Phases 2–6 (spec finalized when reached — objectives + gates only)
+## Phase 2 — Live-session integration  ✅ DONE
 
-- **Phase 2 — Live-session integration.** `pi -e ./packages/relay`; invoke
-  `verify_phase`. Gate: verdict arrives as an async **follow-up turn**. Confirm Q1
-  (`triggerTurn` immediate vs. queued-on-idle).
+**Entry phases:** Phase 1 (merged to `main` @ `80e0be5`). Own branch `feat/relay-phase2`
+→ own PR.
+
+### Objectives
+Prove the **real pi runtime** delivers the async verdict as a **follow-up turn** — the
+one thing the Phase-1 mock (stub `ExtensionAPI`) could not: real
+`sendMessage(…, { triggerTurn: true })` delivery. Answer **Q1** (does `triggerTurn`
+fire immediately, or queue until the orchestrator is idle / `ctx.isIdle()`), and if
+delivery is not reliable, mirror pi-intercom's idle flush-queue so the verdict always
+lands.
+
+### Architectural Constraints
+- Locked Decisions **D1–D10** continue to hold; the `verify_phase`/`dispatch` contract
+  and the driver seam do **not** change shape.
+- Any Q1 fix is **additive/behavioral** (queue-and-flush on idle) — it must not weaken
+  **D4** (non-blocking `execute()`) or **D6** (fail-safe `UNVERIFIED`, never auto-PASS).
+- **No new runtime dependencies** (peer-deps stay = D5; lockfile stays in sync, Gate 4).
+
+### Actionable TODOs (literal paths)
+- [ ] `packages/relay/scripts/live-session.mjs` — a **scriptable live-session
+  integration harness**: launch a real `pi` session with `--extension ./packages/relay`
+  in a programmatic mode (`--mode rpc`, falling back to `--mode json`), send a user
+  turn that invokes `verify_phase`, **keep the session alive**, and capture from the
+  real runtime: (a) the tool returns `PENDING` immediately, (b) an **async follow-up
+  turn** carrying `VERDICT: PASS|FAIL` arrives via the pushback, (c) the **timing of
+  `triggerTurn`** (immediate vs. after idle) = the Q1 answer. Print OK/FAIL checks like
+  `harness.mjs`; exit 0 iff async delivery is observed. **Not** part of `npm run check`.
+- [ ] `packages/relay/index.ts` — **only if Q1 requires it**: if `triggerTurn` queues
+  until idle, add a pi-intercom-style `ctx.isIdle()` flush-queue so the verdict is
+  delivered reliably. If Q1 shows immediate delivery, make **no** code change and record
+  that in the report. Any change stays within D4/D6.
+- [ ] `packages/relay/README.md` — a short "Live-session behavior" note documenting the
+  Q1 finding (immediate vs. idle-queued) so users know when the verdict lands.
+
+### Testing Gates (exact command → expected)
+- **Gate 2.1 — live async delivery (real runtime).**
+  Command: `node packages/relay/scripts/live-session.mjs` (real `pi` + `claude` authed
+  via `oauthAccount`).
+  Expected: real output showing the tool returned `PENDING`, then an **async follow-up
+  turn with `VERDICT: PASS|FAIL`** delivered by the live runtime, plus the Q1 timing
+  line. **UNVERIFIED** (never faked) if the environment genuinely cannot drive an
+  rpc/interactive `pi` session — escalate to the orchestrator instead.
+- **Gate 2.2 — regression.**
+  Command: `npm run check` → exit 0 (vitest green; if a Q1 idle-flush change was made,
+  add/extend a unit test covering it).
+- **Gate 2.3 — lockfile parity.**
+  Command: `npm ci` → exit 0; `npm install` → no further diff (Gate 4 carries forward).
+  Also re-run Phase-1 `node packages/relay/scripts/harness.mjs` if `index.ts` changed.
+
+### Definition of Done
+Appendix D items 1–8 hold; Gate 2.1 proven (or UNVERIFIED + escalated, never faked);
+Q1 documented in the README; if `index.ts` changed, the async substrate still proves
+out via `harness.mjs`.
+
+## Phases 3–6 (spec finalized when reached — objectives + gates only)
 - **Phase 3 — Accuracy regression.** Drive the locked 9-case benchmark **through the
   extension**. Gate: 9/9 — 0 false-merge, 0 false-fail, 3/3 audit-catch.
 - **Phase 4 — Wire into the phase loop (self-hosting).** Orchestrator dispatches
@@ -174,6 +229,65 @@ seam with verdict-parse in the consumer (D10).
   human escalation (true pi↔pi / cross-session channel).
 
 ---
+
+## Phase 7 — "Relay Roles" generalization (post-Phase-5)
+
+**Entry phases:** Phase 5 (verifier path proven in production — do not generalize
+before the flagship role is proven). Own branch `feat/relay-roles` → own PR.
+
+### Objectives
+Generalize the async-dispatch substrate into a reusable **role** abstraction so new
+agent roles (research, summarize, triage, lint, …) can be added declaratively,
+following the same methodology as `verify_phase`. Prove it by shipping a **second
+reference role** that legitimately differs from the verifier (different tools/model).
+
+### The role abstraction
+A relay **role** is a tuple over the shared non-blocking spine (`runDriverAsync` →
+`sendMessage(…, { triggerTurn: true })`) — the same spine `verify_phase` and
+`dispatch` already use:
+- **tool name + TypeBox param schema**
+- **`buildPrompt(params)`** — the default prompt (caller-overridable via a `prompt` param)
+- **backend opts** — `{ model, allowedTools, maxTurns }` passed to the driver
+- **`interpret(result, cut)`** — result text → typed outcome (verdict / report /
+  fail-safe `UNVERIFIED`)
+- **`format(outcome)`** — the pushback `customType`, content, and details
+
+Today `verify_phase` = {verify prompt, read-only tools, verdict interpreter,
+`relay:verify_phase`} and `dispatch` = {passthrough} — both hand-rolled. Phase 7
+extracts the shared shape.
+
+### Actionable TODOs (literal paths — finalize when reached)
+- [ ] `packages/relay/roles.ts` — a `defineRelayRole(spec)` factory that registers a
+  tool over the shared substrate; refactor `verify_phase` and `dispatch` to be defined
+  through it, **behavior-preserving** (Phase-1/2 gates must still pass unchanged).
+- [ ] `packages/relay/drivers/claude.ts` — extend `AgentDriver.buildArgs(prompt, opts)`
+  to accept `{ model, allowedTools, maxTurns }`; `claudeDriver` keeps the verifier
+  defaults (D1/D2/D3) when opts are omitted.
+- [ ] `packages/relay/roles/research.ts` — a second reference role: web-tool scope
+  (`WebSearch WebFetch Read`), a research prompt, a report/citations interpreter,
+  `relay:research` pushback. Demonstrates a role that **deliberately relaxes D1/D2**.
+- [ ] `docs/relay-roles.md` — the documented "Relay Roles" pattern and a how-to-add-a-role
+  guide (the reusable methodology).
+
+### Architectural Constraints
+- The refactor is **behavior-preserving** for `verify_phase`/`dispatch` — the
+  registration test, `harness.mjs`, and `live-session.mjs` must all still pass.
+- **D1/D2 remain the defaults** and stay in force for the **verify** role; only new
+  roles opt into different tools/models via explicit opts. "Roles" is a superset that
+  lives *above* the verifier's Locked Decisions, not a violation of them.
+- Async spine (D4), fail-safe (D6), re-entrancy (D8), no-returned-`isError` (D9), and
+  the driver seam (D10) are all preserved.
+
+### Testing Gates (finalize when reached)
+- **Gate 7.1** — `npm run check` green; `verify_phase`/`dispatch` behave **identically**
+  after the refactor (unit tests unchanged; `harness.mjs` still 5/5).
+- **Gate 7.2** — the new reference role dispatches and relays a result through the
+  **real runtime** (a `live-session.mjs`-style proof for the new role).
+- **Gate 7.3** — lockfile parity (Gate 4) for any new dependency.
+
+### Resolves
+- The productization angle of **Q2** (per-role prompt-source strategy) and **Q3**
+  (config knobs: per-role `model` / `allowedTools` / `maxTurns`).
 
 ## Appendix A — proven reference (approach B)
 
@@ -215,11 +329,12 @@ the deviation to the orchestrator for human decision. Do not self-approve.
 
 - [x] Phase 0 — Logo & brand assets
 - [x] Phase 1 — Scaffold + driver seam + unit-prove
-- [ ] Phase 2 — Live-session integration
+- [x] Phase 2 — Live-session integration
 - [ ] Phase 3 — Accuracy regression
 - [ ] Phase 4 — Wire into the phase loop
 - [ ] Phase 5 — Gate B
 - [ ] Phase 6 — (optional) Duplex escalation
+- [ ] Phase 7 — "Relay Roles" generalization (post-Phase-5)
 
 ## Appendix D — Definition of Done (full-repo regression; verifier runs all)
 
