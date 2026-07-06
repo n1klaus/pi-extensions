@@ -99,6 +99,31 @@ describe("claudeDriver — tool-name map (D10, in the driver)", () => {
   });
 });
 
+describe("claudeDriver — read-only by declaration, NO OS sandbox (D12)", () => {
+  // D12 (revised): relay expresses a read-only posture by DECLARATION — it maps
+  // only the role's declared read-only tools to `--allowedTools` and withholds
+  // Edit/Write. It does NOT OS-sandbox the backend: a filesystem sandbox broke the
+  // verifier's own mandated `npm run check` (vitest writes scratch under `cwd`) and
+  // buys no verdict integrity. Tree-hygiene is enforced by detection (orchestrator
+  // diffs the tree after verify), not by prevention. The driver therefore emits NO
+  // `--settings` sandbox and NO `--disallowedTools`, even for a read-only role.
+  it("emits no sandbox `--settings` and no `--disallowedTools` for a read-only role", () => {
+    const args = claudeDriver.buildArgs({
+      task: "t",
+      model: "opus",
+      tools: ["read", "bash", "grep", "find"],
+    });
+    expect(args).not.toContain("--settings");
+    expect(args).not.toContain("--disallowedTools");
+    // Read-only is by declaration: only the mapped read-only tools are allowed.
+    const idx = args.indexOf("--allowedTools");
+    expect(idx).toBeGreaterThanOrEqual(0);
+    expect(args[idx + 1]).toBe("Read Bash Grep Glob");
+    // D2 still holds: never a permission-skip flag.
+    expect(args).not.toContain("--dangerously-skip-permissions");
+  });
+});
+
 describe("roles resolver — frontmatter + assembly (backend-neutral)", () => {
   const roots: string[] = [];
 

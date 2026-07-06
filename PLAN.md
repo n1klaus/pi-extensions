@@ -58,6 +58,17 @@ keeps the core backend-agnostic.
   `@earendil-works/pi-ai`). Adding an **official** pi package as a peer-dep is permitted and
   is **not** the forbidden `@mariozechner` fork (D5). Re-implementing a pi contract by hand
   is a defect.
+- **D12 (read-only by declaration + detect/present, NOT sandbox)** relay does **not** OS-sandbox
+  dispatched agents. A role's read-only posture is expressed by its **declared tools** — relay maps
+  only those to the backend (withholding Edit/Write). A hard filesystem sandbox is **rejected**: it
+  breaks the verifier's own mandated gates (`vitest` writes scratch under `node_modules/` *inside* cwd)
+  and buys **no verdict integrity** — a bad verifier returns a wrong verdict without writing a byte, so
+  write-blocking is the wrong lever. Instead, tree-hygiene is enforced by **detection, not prevention**:
+  the verifier runs in the real git-tracked tree; **after** verify the orchestrator diffs the tree, and
+  if the verifier changed anything it **presents the diff to the human and asks discard-or-keep** before
+  acting on the verdict. Containment already holds — the verifier can't merge/tick (**D7**), its changes
+  are git-visible + uncommitted, and merge is human-gated. (Supersedes the Phase-5 Seatbelt-sandbox
+  spike, reverted.)
 
 ## Git / PR conventions (PLAN-wide)
 
@@ -375,10 +386,91 @@ the public repo; no IP leak (Gate 4.3 clean). Appendix D full-repo regression ho
 
 ---
 
-## Phases 5–7 (spec finalized when reached — objectives + gates only)
-- **Phase 5 — Wire into the phase loop (self-hosting).** Orchestrator runs the verifier
-  relay-role instead of the local verifier subagent; PASS → human merge-gate, FAIL →
-  remediation. Gate: an end-to-end phase verifies and routes correctly.
+## Phase 5 — Wire into the phase loop (self-hosting)  ← ACTIVE
+
+### Objectives
+Wire the real pi phase loop so the **orchestrator** dispatches the **relay verifier**
+(`verifier.md`, already `relay-claude/opus`) and routes **PASS → human merge-gate**, **FAIL →
+remediation** — and harden the two Phase-4 findings per the locked architecture. **Scope: demonstrate,
+then cut over** (Q1) — prove the wiring end-to-end this phase; the real loop fully self-hosts on
+relay only **after Gate B (Phase 6)**. Spans two repos: `packages/relay` (enforcement code) and the
+user's **dotfiles** orchestration (`phase-orchestrate` skill, `verifier.md`, `merger.md`) — dotfiles
+changes are reported as diffs for the human to commit (as in Phase 3/4), never auto-committed.
+
+### Part 1 — Read-only by declaration; NO sandbox (D12 revised, `packages/relay`)
+- **Revert the driver OS sandbox** (the `--settings` Seatbelt `denyWrite:[cwd]` + `--disallowedTools`
+  enforcement from the reverted spike). It broke the verifier's own **mandated** gates (`vitest` writes
+  scratch to `node_modules/.vite-temp` *inside* cwd → EPERM, zero tests collected) and buys **no verdict
+  integrity** (a bad verifier returns a wrong verdict without writing a byte). A read-only role is
+  read-only **by declaration**: relay maps only its declared read-only tools to the backend (no
+  Edit/Write) and does **not** OS-sandbox. The read-only verifier MUST be able to run the repo's full
+  `npm run check` (incl. `vitest`) **in-tree**.
+
+### Part 1b — Tree-hygiene by detection, human-decides (D12, dotfiles orchestration)
+- Enforcement that "the verifier didn't tamper with the tree" is by **detection, not prevention**:
+  **after** verify, the orchestrator diffs the working tree; if the verifier changed anything it
+  **presents the diff to the human and asks whether to discard or keep**, and does **not** act on the
+  verdict until the human decides. Containment already holds — the verifier can't merge/tick (**D7**),
+  its changes are git-visible + uncommitted, and merge is human-gated.
+
+### Part 2 — Dispatch cardinality (Q3=1, in dotfiles)
+- `phase-orchestrate` skill instructs the orchestrator to dispatch verify **exactly once**, then wait
+  for the verdict. relay stays a clean per-completion provider (no dedup state); **D8** re-entrancy
+  guard is the process-level backstop. **No relay code** for this — it's the caller's contract.
+
+### Part 3 — Routing (dotfiles orchestration)
+- Orchestrator routes the relay verdict: **PASS → stop at the human merge-gate** (never auto-merge/
+  tick — **D7**); **FAIL → remediation** (back to builder with the evidence). `merger.md` unchanged
+  except to consume the relay verdict.
+
+### Part 3b — Read-only verifier: disable the completion guard (root cause of the exit-1 FAIL)
+- A read-only verifier makes **no file edits**, so pi-subagents flips its exit **0 → 1** via the
+  **completion/no-edits guard** (`execution.ts:838` → "completed without making edits for an
+  implementation task"); a *failed* run's inline output is then replaced by a `[failed]` summary,
+  **burying the verdict** (the orchestrator must artifact-grep to recover it → risks misrouting a real
+  PASS/FAIL as an execution failure). **Fix (set once, robust):** `completionGuard: false` in
+  **`verifier.md` frontmatter** — the agent loader honors it (`agents.ts:1156` coerces the string),
+  and `execution.ts:838` then skips the guard entirely. **Do NOT set `acceptance` on the dispatch:** the
+  acceptance gate only flips the exit when acceptance is **explicit** (`execution.ts:1099`); left
+  inferred (`explicit=false`) it never fails the run. ⚠️ The earlier
+  `acceptance: { level: "none", reason }` approach is **rejected on two counts** (both observed live):
+  (a) the local orchestrator **can't emit the nested object** — qwen serialized it as a JSON *string* →
+  tool-validation error → forced a `false` fallback; (b) it targeted the wrong gate (the completion
+  guard, not acceptance, is what failed the run). With `completionGuard:false` + no acceptance param the
+  verify run exits **0** and its `VERDICT` flows into the subagent tool result inline (pi default
+  `outputMode:"inline"`) — no artifact-grep. **Not a relay issue** — a local read-only verifier hits the
+  identical guard.
+
+### Testing Gates (exact → expected)
+- **Gate 5.1 (no sandbox breakage):** the read-only verifier runs the repo's **full `npm run check`
+  (incl. `vitest`) to a real pass/fail in-tree** — no EPERM, tests actually collected. Proves the
+  reverted sandbox unbroke verification.
+- **Gate 5.2 (routing) — CITE REAL ARTIFACTS:** end-to-end via the real orchestrator (qwen `:11439`) →
+  relay verifier (Opus): one **PASS** halts at the human merge-gate (no auto-merge/tick, D7); one
+  **FAIL** → remediation. **Commit/cite the run transcripts** (distinct `toolCallId`s) — a claim is not
+  proof (the first attempt cited none).
+- **Gate 5.3 (dispatch cardinality):** exactly **one** verify dispatch per scenario, re-derivable from
+  the cited artifacts.
+- **Gate 5.4 (tree-hygiene detect+present):** a verify that mutates the tree is **detected** and
+  **surfaced to the human** (keep/discard) before the verdict is acted on — demonstrated.
+- **Gate 5.5 (repo):** `npm run check` green; lockfile in sync; ADR 0002 **rewritten** to the detect
+  model + indexed (Appendix B).
+- **Gate 5.6 (verify exits 0 + verdict in-result, VERBATIM skill):** with `completionGuard: false` on
+  `verifier.md` (and NO `acceptance` param on the dispatch), the verifier run exits **0**, and its
+  `VERDICT` appears in the **subagent tool result** (not only an artifact). Gates 5.2–5.4 routing
+  re-proven with the orchestrator driven by the **verbatim shipped `phase-orchestrate` skill** — NO
+  hand-injected grep/outputPath logic in the prompt.
+
+### Definition of Done
+Driver sandbox **reverted**; the read-only verifier runs the full `npm run check` in-tree (Gate 5.1);
+orchestrator dispatches verify exactly once, routes PASS/FAIL correctly, and **presents any verifier
+tree-change to the human** (Gates 5.2–5.4) — all proven with **cited** artifacts; real-loop cutover
+deferred to post-Gate-B; D12 + ADR rewritten; dotfiles diffs reported for the human to commit;
+Appendix D regression holds.
+
+---
+
+## Phases 6–7 (spec finalized when reached — objectives + gates only)
 - **Phase 6 — Gate B.** 25 live orchestrated verify runs. Gate: 0 false-merge across all 25.
   Then flip `"private": false` + Release Please for 1.0.0.
 - **Phase 7 — (optional) Duplex escalation.** Intercom-broker ask-reply for human escalation
@@ -417,9 +509,10 @@ The 5-step proof `harness.mjs` must print: (1) `verify_phase` registered;
 
 ## Appendix B — ADR index
 
-| ADR  | Slug                     | Phase | Status   |
-| ---- | ------------------------ | ----- | -------- |
-| 0001 | pi-ai-peer-dependency    | 3     | Accepted |
+| ADR  | Slug                          | Phase | Status   |
+| ---- | ----------------------------- | ----- | -------- |
+| 0001 | pi-ai-peer-dependency         | 3     | Accepted |
+| 0002 | per-role-execution-posture (read-only by declaration; tree-hygiene by detection — sandbox rejected) | 5 | Accepted |
 
 If a deviation from a literal TODO or a Locked Decision is genuinely required,
 create `docs/decisions/000N-<slug>.md` (MADR-lite: **Context / Decision /
@@ -434,7 +527,7 @@ the official `@earendil-works/pi-ai` peer-dep + deletion of the hand-rolled
 - [x] Phase 1 — Scaffold + driver seam + unit-prove
 - [x] Phase 2 — Live-session integration
 - [x] Phase 3 — Relay Roles (provider seam)
-- [ ] Phase 4 — Accuracy regression (through the role)
+- [x] Phase 4 — Accuracy regression (through the role)
 - [ ] Phase 5 — Wire into the phase loop
 - [ ] Phase 6 — Gate B
 - [ ] Phase 7 — (optional) Duplex escalation
