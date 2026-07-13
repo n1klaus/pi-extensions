@@ -5,9 +5,9 @@
  * client to the local Python Headroom proxy). This module owns:
  *
  *   - `resolveConfig()` — resolves the proxy base URL + optional API key from
- *     (in precedence order) an explicit argument, `AuthStorage` under the
- *     "headroom" key, the `HEADROOM_BASE_URL` / `HEADROOM_API_KEY` environment
- *     variables, and finally the default `http://127.0.0.1:8787`.
+ *     (in precedence order) an explicit argument, the `HEADROOM_BASE_URL` /
+ *     `HEADROOM_API_KEY` environment variables, `AuthStorage.getApiKey()`, and
+ *     finally the default `http://127.0.0.1:8787`.
  *   - `getClient()` — a memoized `HeadroomClient` instance.
  *   - `isHealthy()` — a short-TTL cached health probe that resolves `false` on
  *     any error and **never throws** (LD3).
@@ -45,16 +45,23 @@ export interface ResolvedConfig {
 /**
  * Resolve the proxy configuration.
  *
- * Precedence: explicit arg → `AuthStorage("headroom")` → environment
- * (`HEADROOM_BASE_URL` / `HEADROOM_API_KEY`) → default `http://127.0.0.1:8787`.
+ * Base URL precedence: explicit arg → `HEADROOM_BASE_URL` env → default
+ * `http://127.0.0.1:8787`.
+ *
+ * API key precedence: explicit arg → `AuthStorage.getApiKey("headroom")` →
+ * `HEADROOM_API_KEY` env → undefined.
+ *
+ * NOTE: The original Pi SDK (`@earendil-works/pi-coding-agent`) exposed an
+ * `auth.get("headroom")` method that returned a credential config object
+ * with `.env` properties. oh-my-pi's `AuthStorage` (`@oh-my-pi/pi-coding-agent`)
+ * does not have `.get()` — it uses `getApiKey()` which returns a string.
+ * This version drops the `.get()` call and resolves the base URL from
+ * environment variables instead, which is compatible with both SDKs.
  */
 export async function resolveConfig(args: ResolveConfigArgs = {}): Promise<ResolvedConfig> {
   const auth = args.authStorage ?? AuthStorage.create();
 
-  const stored = auth.get("headroom");
-  const storedBaseUrl = stored?.type === "api_key" ? stored.env?.HEADROOM_BASE_URL : undefined;
-  const baseUrl =
-    args.baseUrl ?? storedBaseUrl ?? process.env.HEADROOM_BASE_URL ?? DEFAULT_BASE_URL;
+  const baseUrl = args.baseUrl ?? process.env.HEADROOM_BASE_URL ?? DEFAULT_BASE_URL;
 
   let apiKey = args.apiKey;
   if (!apiKey) {
