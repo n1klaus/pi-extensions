@@ -9,7 +9,6 @@
  *     the `HEADROOM_BASE_URL` / `HEADROOM_API_KEY` environment variables, and
  *     finally the default `http://127.0.0.1:8787`.
  *
-
  *   - `getClient()` — a memoized `HeadroomClient` instance.
  *   - `isHealthy()` — a short-TTL cached health probe that resolves `false` on
  *     any error and **never throws** (LD3).
@@ -48,17 +47,14 @@ export interface ResolvedConfig {
  * Resolve the proxy configuration.
  *
  * Base URL precedence: explicit arg → `HEADROOM_BASE_URL` env → default
- * `http://127.0.0.1:8787`.
+ * (`http://127.0.0.1:8787`).
  *
  * API key precedence: explicit arg → `AuthStorage.getApiKey("headroom")` →
  * `HEADROOM_API_KEY` env → undefined.
  *
- * NOTE: The original Pi SDK (`@earendil-works/pi-coding-agent`) exposed an
- * `auth.get("headroom")` method that returned a credential config object
- * with `.env` properties. oh-my-pi's `AuthStorage` (`@oh-my-pi/pi-coding-agent`)
- * does not have `.get()` — it uses `getApiKey()` which returns a string.
- * This version drops the `.get()` call and resolves the base URL from
- * environment variables instead, which is compatible with both SDKs.
+ * The API key is read through `getApiKey()` — the portable `AuthStorage`
+ * accessor — rather than a stored credential object, so resolution works
+ * across SDK variants. The lookup is best-effort and never throws (LD3).
  */
 export async function resolveConfig(args: ResolveConfigArgs = {}): Promise<ResolvedConfig> {
   const auth = args.authStorage ?? AuthStorage.create();
@@ -73,6 +69,8 @@ export async function resolveConfig(args: ResolveConfigArgs = {}): Promise<Resol
       apiKey = undefined;
     }
   }
+  // Only accept a real string key; fall back to the environment otherwise.
+  if (typeof apiKey !== "string") apiKey = undefined;
   apiKey = apiKey ?? process.env.HEADROOM_API_KEY;
 
   return { baseUrl, apiKey };
