@@ -8,6 +8,7 @@
  *     (in precedence order) an explicit argument, `AuthStorage.getApiKey()`,
  *     the `HEADROOM_BASE_URL` / `HEADROOM_API_KEY` environment variables, and
  *     finally the default `http://127.0.0.1:8787`.
+ *
 
  *   - `getClient()` — a memoized `HeadroomClient` instance.
  *   - `isHealthy()` — a short-TTL cached health probe that resolves `false` on
