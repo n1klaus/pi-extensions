@@ -125,7 +125,12 @@ export async function isHealthy(args?: ResolveConfigArgs): Promise<boolean> {
     const status = await client.health();
     value = status?.status === "healthy";
   } catch (error) {
-    console.error("[headroom] health check failed:", error);
+    // Developer diagnostics only — goes to pi's debug log, not the TUI. The
+    // user-facing passthrough notice is emitted once at the session_start call
+    // site via ctx.ui.notify. Quiet by default; opt in with HEADROOM_DEBUG.
+    if (process.env.HEADROOM_DEBUG) {
+      console.error("[headroom] health check failed:", error);
+    }
     value = false;
   }
 
