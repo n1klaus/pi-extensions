@@ -100,7 +100,7 @@ export function getClient(args?: ResolveConfigArgs): Promise<HeadroomClient> {
   return clientPromise;
 }
 
-/** Reset the memoized client + health cache (test/teardown helper). */
+/** Reset memoized client + health cache (test/teardown helper). */
 export function resetClient(): void {
   clientPromise = undefined;
   healthCache = undefined;
@@ -124,7 +124,8 @@ export async function isHealthy(args?: ResolveConfigArgs): Promise<boolean> {
     const client = await getClient(args);
     const status = await client.health();
     value = status?.status === "healthy";
-  } catch {
+  } catch (error) {
+    console.error("[headroom] health check failed:", error);
     value = false;
   }
 
